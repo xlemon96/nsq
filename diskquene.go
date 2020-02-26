@@ -252,6 +252,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 	return err
 }
 //此函数为从数据文件当中读取一个消息
+//若发生异常，则调用handleReadError函数，直接跳过此文件，并标记此文件为坏文件
 func (d *diskQueue) readOne() ([]byte, error) {
 	var err error
 	var msgSize int32
@@ -286,12 +287,6 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		return nil, err
 	}
 	//若消息长度不符合要求，则证明文件损坏
-	//-----------------
-	//-----------------
-	//此处有疑问，若此处仅仅关闭文件句柄并置为空，则下次读取数据依旧有问题
-	//为何不将读文件序号加+1，将此文件作废
-	//-----------------
-	//-----------------
 	if msgSize < d.minMsgSize || msgSize > d.maxMsgSize {
 		d.readFile.Close()
 		d.readFile = nil
