@@ -49,64 +49,65 @@ func (l LogLevel) String() string {
 
 type Interface interface {
 	Put([]byte) error
-	ReadChan() <-chan []byte // this is expected to be an *unbuffered* channel
+	ReadChan() <-chan []byte
 	Close() error
 	Delete() error
 	Depth() int64
 	Empty() error
 }
 
-// diskQueue implements a filesystem backed FIFO queue
 type diskQueue struct {
-	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-
-	// run-time state (also persisted to disk)
+	sync.RWMutex
+	//读写游标、读写文件序号
 	readPos      int64
 	writePos     int64
 	readFileNum  int64
 	writeFileNum int64
+	//队列深度，即还有多少消息可以读
 	depth        int64
-
-	sync.RWMutex
-
-	// instantiation time metadata
+	//diskquene名字，已经数据路径
+	//通常name为topic:channel
 	name            string
 	dataPath        string
-	maxBytesPerFile int64 // currently this cannot change once created
+	//单个数据文件最大大小
+	maxBytesPerFile int64
+	//最大最小的消息大小
 	minMsgSize      int32
 	maxMsgSize      int32
-	syncEvery       int64         // number of writes per fsync
-	syncTimeout     time.Duration // duration of time per fsync
+	//触发同步的周期和io次数
+	syncEvery       int64
+	syncTimeout     time.Duration
+	//循环退出标志
 	exitFlag        int32
+	//同步标志，true触发同步
 	needSync        bool
-
-	// keeps track of the position where we have read
-	// (but not yet sent over readChan)
+	//下一次的读游标和文件序号
+	//这两个参数主要用以保证是否已经有一个消息被上游读走
+	//若nextReadPos=readPos，则消息已经读走，在movaFoward函数中触发
 	nextReadPos     int64
 	nextReadFileNum int64
-
+	//读写文件句柄即相关buffer
 	readFile  *os.File
 	writeFile *os.File
 	reader    *bufio.Reader
 	writeBuf  bytes.Buffer
-
-	// exposed via ReadChan()
+	//读chan，用以上游读取diskquene的消息
 	readChan chan []byte
-
-	// internal channels
+	//深度chan
 	depthChan         chan int64
+	//写chan，写响应chan
 	writeChan         chan []byte
 	writeResponseChan chan error
+	//置空diskquene chan，响应chan
 	emptyChan         chan int
 	emptyResponseChan chan error
+	//退出chan
 	exitChan          chan int
+	//保证循环退出之后再结束diskquene队列
 	exitSyncChan      chan int
-
 	logf AppLogFunc
 }
-
-// New instantiates an instance of diskQueue, retrieving metadata
-// from the filesystem and starting the read ahead goroutine
+//实力化一个diskquene
 func New(name string, dataPath string, maxBytesPerFile int64,
 	minMsgSize int32, maxMsgSize int32,
 	syncEvery int64, syncTimeout time.Duration, logf AppLogFunc) Interface {
@@ -128,41 +129,34 @@ func New(name string, dataPath string, maxBytesPerFile int64,
 		syncTimeout:       syncTimeout,
 		logf:              logf,
 	}
-
-	// no need to lock here, nothing else could possibly be touching this instance
 	err := d.retrieveMetaData()
 	if err != nil && !os.IsNotExist(err) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.name, err)
 	}
-
 	go d.ioLoop()
 	return &d
 }
-
-// Depth returns the depth of the queue
+//返回队列深度，即还有多少消息没有读取
+//之所以采用chan形式，可以保证在读取深度这一行为时不会同时有读写行为在发生
+//否则需要通过lock形式来保证深度数据的正确性
 func (d *diskQueue) Depth() int64 {
 	return <-d.depthChan
 }
-
-// ReadChan returns the receive-only []byte channel for reading data
+//返回一个读chan，获取从硬盘读取的消息
 func (d *diskQueue) ReadChan() <-chan []byte {
 	return d.readChan
 }
-
-// Put writes a []byte to the queue
+//放入一个消息到diskquene，阻塞函数，直到数据写入持久化文件
 func (d *diskQueue) Put(data []byte) error {
 	d.RLock()
 	defer d.RUnlock()
-
 	if d.exitFlag == 1 {
 		return errors.New("exiting")
 	}
-
 	d.writeChan <- data
 	return <-d.writeResponseChan
 }
-
-// Close cleans up the queue and persists metadata
+//关闭循环，此函数会调用sync函数，将数据强行刷盘，不会导致数据丢失
 func (d *diskQueue) Close() error {
 	err := d.exit(false)
 	if err != nil {
@@ -170,81 +164,75 @@ func (d *diskQueue) Close() error {
 	}
 	return d.sync()
 }
-
+//退出循环，只是决定日志打印内容
 func (d *diskQueue) Delete() error {
 	return d.exit(true)
 }
-
+//退出diskquene循环
 func (d *diskQueue) exit(deleted bool) error {
 	d.Lock()
 	defer d.Unlock()
-
 	d.exitFlag = 1
-
 	if deleted {
 		d.logf(INFO, "DISKQUEUE(%s): deleting", d.name)
 	} else {
 		d.logf(INFO, "DISKQUEUE(%s): closing", d.name)
 	}
-
+	//关闭diskquene循环
 	close(d.exitChan)
-	// ensure that ioLoop has exited
+	//确保循环已经退出
 	<-d.exitSyncChan
-
+	//关闭读写文件句柄
 	if d.readFile != nil {
 		d.readFile.Close()
 		d.readFile = nil
 	}
-
 	if d.writeFile != nil {
 		d.writeFile.Close()
 		d.writeFile = nil
 	}
-
 	return nil
 }
-
-// Empty destructively clears out any pending data in the queue
-// by fast forwarding read positions and removing intermediate files
+//将此diskquene数据置空
 func (d *diskQueue) Empty() error {
 	d.RLock()
 	defer d.RUnlock()
-
+	//若循环已经退出，则返回error
 	if d.exitFlag == 1 {
 		return errors.New("exiting")
 	}
-
 	d.logf(INFO, "DISKQUEUE(%s): emptying", d.name)
-
 	d.emptyChan <- 1
 	return <-d.emptyResponseChan
 }
-
+//删除所有的文件
+//1、跳转到下一个可读可写文件，相当于删除有数据的文件
+//2、删除元数据文件
 func (d *diskQueue) deleteAllFiles() error {
 	err := d.skipToNextRWFile()
-
 	innerErr := os.Remove(d.metaDataFileName())
 	if innerErr != nil && !os.IsNotExist(innerErr) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to remove metadata file - %s", d.name, innerErr)
 		return innerErr
 	}
-
 	return err
 }
-
+//跳到下一个可读可写文件
+//若此时在读*000001.dat
+//在写*000003.dat
+//则此函数直接将读写文件均到*000004.dat
 func (d *diskQueue) skipToNextRWFile() error {
 	var err error
-
+	//若此时读写文件均不为空，则关闭文件句柄，置空文件指针
 	if d.readFile != nil {
 		d.readFile.Close()
 		d.readFile = nil
 	}
-
 	if d.writeFile != nil {
 		d.writeFile.Close()
 		d.writeFile = nil
 	}
-
+	//将已写未读的文件均删除
 	for i := d.readFileNum; i <= d.writeFileNum; i++ {
 		fn := d.fileName(i)
 		innerErr := os.Remove(fn)
@@ -253,7 +241,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 			err = innerErr
 		}
 	}
-
+	//将相关游标属性重置
 	d.writeFileNum++
 	d.writePos = 0
 	d.readFileNum = d.writeFileNum
@@ -261,7 +249,6 @@ func (d *diskQueue) skipToNextRWFile() error {
 	d.nextReadFileNum = d.writeFileNum
 	d.nextReadPos = 0
 	d.depth = 0
-
 	return err
 }
 //此函数为从数据文件当中读取一个消息
@@ -272,6 +259,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	//1、diskquene初始化的时候
 	//2、读完一个文件的时候
 	//3、读取文件异常的时候
+	//4、跳转到下一个可读可写的时候
 	//此时需要重新打开文件
 	if d.readFile == nil {
 		curFileName := d.fileName(d.readFileNum)
@@ -340,6 +328,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 	//1、diskquene初始化的时候
 	//2、达到同步条件，同步完成之后
 	//3、写入消息的时候发生异常
+	//4、跳转到下一个可读可写的时候
 	//此时需要重新打开文件
 	if d.writeFile == nil {
 		//通过此时写文件序号返回待写文件文件名称
@@ -488,14 +477,12 @@ func (d *diskQueue) metaDataFileName() string {
 func (d *diskQueue) fileName(fileNum int64) string {
 	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.%06d.dat"), d.name, fileNum)
 }
-
+//检查读写进度并且校验数据是否发生异常
 func (d *diskQueue) checkTailCorruption(depth int64) {
 	if d.readFileNum < d.writeFileNum || d.readPos < d.writePos {
 		return
 	}
-
-	// we've reached the end of the diskqueue
-	// if depth isn't 0 something went wrong
+	//进入后面的条件为readFileNum=writeFileNum并且readPos=writePos
 	if depth != 0 {
 		if depth < 0 {
 			d.logf(ERROR,
@@ -506,50 +493,44 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 				"DISKQUEUE(%s) positive depth at tail (%d), data loss, resetting 0...",
 				d.name, depth)
 		}
-		// force set depth 0
 		d.depth = 0
 		d.needSync = true
 	}
-
+	//若出现两者中的一个，则文件出现异常，跳转打下一个可读可写文件
 	if d.readFileNum != d.writeFileNum || d.readPos != d.writePos {
 		if d.readFileNum > d.writeFileNum {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) readFileNum > writeFileNum (%d > %d), corruption, skipping to next writeFileNum and resetting 0...",
 				d.name, d.readFileNum, d.writeFileNum)
 		}
-
 		if d.readPos > d.writePos {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) readPos > writePos (%d > %d), corruption, skipping to next writeFileNum and resetting 0...",
 				d.name, d.readPos, d.writePos)
 		}
-
 		d.skipToNextRWFile()
 		d.needSync = true
 	}
 }
-
+//将读相关游标往前移动
 func (d *diskQueue) moveForward() {
 	oldReadFileNum := d.readFileNum
 	d.readFileNum = d.nextReadFileNum
 	d.readPos = d.nextReadPos
 	d.depth -= 1
-
-	// see if we need to clean up the old file
+	//若旧文件序号不等于新文件序号，则证明就文件依旧读完，需要删除
 	if oldReadFileNum != d.nextReadFileNum {
-		// sync every time we start reading from a new file
+		//当读取新文件时强行刷新
 		d.needSync = true
-
 		fn := d.fileName(oldReadFileNum)
 		err := os.Remove(fn)
 		if err != nil {
 			d.logf(ERROR, "DISKQUEUE(%s) failed to Remove(%s) - %s", d.name, fn, err)
 		}
 	}
-
 	d.checkTailCorruption(d.depth)
 }
-
+//处理读错误
 func (d *diskQueue) handleReadError() {
 	// jump to the next read file and rename the current (bad) file
 	if d.readFileNum == d.writeFileNum {
@@ -562,52 +543,38 @@ func (d *diskQueue) handleReadError() {
 		d.writeFileNum++
 		d.writePos = 0
 	}
-
 	badFn := d.fileName(d.readFileNum)
 	badRenameFn := badFn + ".bad"
-
 	d.logf(WARN,
 		"DISKQUEUE(%s) jump to next file and saving bad file as %s",
 		d.name, badRenameFn)
-
 	err := os.Rename(badFn, badRenameFn)
 	if err != nil {
 		d.logf(ERROR,
 			"DISKQUEUE(%s) failed to rename bad diskqueue file %s to %s",
 			d.name, badFn, badRenameFn)
 	}
-
 	d.readFileNum++
 	d.readPos = 0
 	d.nextReadFileNum = d.readFileNum
 	d.nextReadPos = 0
-
 	// significant state change, schedule a sync on the next iteration
 	d.needSync = true
 }
-
-// ioLoop provides the backend for exposing a go channel (via ReadChan())
-// in support of multiple concurrent queue consumers
-//
-// it works by looping and branching based on whether or not the queue has data
-// to read and blocking until data is either read or written over the appropriate
-// go channels
-//
-// conveniently this also means that we're asynchronously reading from the filesystem
+//diskquene的ioloop
 func (d *diskQueue) ioLoop() {
 	var dataRead []byte
 	var err error
 	var count int64
 	var r chan []byte
-
+	//定期同步定时器
 	syncTicker := time.NewTicker(d.syncTimeout)
-
 	for {
-		// dont sync all the time :)
+		//达到了io同步次数，则置sync为true进行数据刷盘
 		if count == d.syncEvery {
 			d.needSync = true
 		}
-
+		//若需要sync，则刷盘，并置count为0
 		if d.needSync {
 			err = d.sync()
 			if err != nil {
@@ -615,8 +582,10 @@ func (d *diskQueue) ioLoop() {
 			}
 			count = 0
 		}
-
+		//满足readFileNum小于writeFileNum或者readPos小于writePos，则认为有数据可读，可以进入读流程
 		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {
+			//若nextReadPos==readPos，则证明上游channel或者topic已经读取走一个消息，
+			//则此时可以读取一个消息，在moveForward函数中触发nextReadPos==readPos
 			if d.nextReadPos == d.readPos {
 				dataRead, err = d.readOne()
 				if err != nil {
@@ -626,17 +595,15 @@ func (d *diskQueue) ioLoop() {
 					continue
 				}
 			}
+			//只有当dataRead重新赋值，才能将readChan暴露出去，否则，将会把旧数据重新发送到上游
+			//因此若没有发生dataRead重新赋值，将readChan置为空
 			r = d.readChan
 		} else {
 			r = nil
 		}
-
 		select {
-		// the Go channel spec dictates that nil channel operations (read or write)
-		// in a select are skipped, we set r to d.readChan only when there is data to read
 		case r <- dataRead:
 			count++
-			// moveForward sets needSync flag if a file is removed
 			d.moveForward()
 		case d.depthChan <- d.depth:
 		case <-d.emptyChan:
@@ -647,7 +614,7 @@ func (d *diskQueue) ioLoop() {
 			d.writeResponseChan <- d.writeOne(dataWrite)
 		case <-syncTicker.C:
 			if count == 0 {
-				// avoid sync when there's no activity
+				//若此时无io行为，则无需sync，提升性能
 				continue
 			}
 			d.needSync = true
@@ -655,7 +622,6 @@ func (d *diskQueue) ioLoop() {
 			goto exit
 		}
 	}
-
 exit:
 	d.logf(INFO, "DISKQUEUE(%s): closing ... ioLoop", d.name)
 	syncTicker.Stop()
