@@ -9,40 +9,49 @@ import (
 	"time"
 
 	"github.com/nsqio/go-diskqueue"
+
 	"nsq/internal/lg"
 	"nsq/internal/quantile"
 	"nsq/internal/util"
 )
 
 type Topic struct {
-	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	//消息数量、消息总共的字节数量
 	messageCount uint64
 	messageBytes uint64
-
+	//全局锁
 	sync.RWMutex
-
+	//topic名称
 	name              string
+	//topic所有的channel
 	channelMap        map[string]*Channel
+	//持久化队列
 	backend           BackendQueue
+	//内存chan
 	memoryMsgChan     chan *Message
+	//开始、结束、更新chan
 	startChan         chan int
 	exitChan          chan int
 	channelUpdateChan chan int
+	//包装函数
 	waitGroup         util.WaitGroupWrapper
+	//退出标志
 	exitFlag          int32
+	//生成uuid
 	idFactory         *guidFactory
-
+	//是否临时标志
 	ephemeral      bool
+	//删除此channel的清理函数(只有当订阅此topic的消费者数量为0，且此topic为临时topic才会调用)
 	deleteCallback func(*Topic)
+	//保证清理函数只执行一次
 	deleter        sync.Once
-
+	//暂停标志，暂定chan
 	paused    int32
 	pauseChan chan int
-
+	//全局context，包含nsqd结构体
 	ctx *context
 }
-
-// Topic constructor
+//新建一个topic
 func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topic {
 	t := &Topic{
 		name:              topicName,
@@ -57,7 +66,6 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		deleteCallback:    deleteCallback,
 		idFactory:         NewGUIDFactory(ctx.nsqd.getOpts().ID),
 	}
-	// create mem-queue only if size > 0 (do not use unbuffered chan)
 	if ctx.nsqd.getOpts().MemQueueSize > 0 {
 		t.memoryMsgChan = make(chan *Message, ctx.nsqd.getOpts().MemQueueSize)
 	}
@@ -80,46 +88,38 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 			dqLogf,
 		)
 	}
-
 	t.waitGroup.Wrap(t.messagePump)
-
 	t.ctx.nsqd.Notify(t)
-
 	return t
 }
-
+//开启一个topic的loop
 func (t *Topic) Start() {
 	select {
 	case t.startChan <- 1:
 	default:
 	}
 }
-
-// Exiting returns a boolean indicating if this topic is closed/exiting
+//topic是否退出，判断退出标致是否为1
 func (t *Topic) Exiting() bool {
 	return atomic.LoadInt32(&t.exitFlag) == 1
 }
-
-// GetChannel performs a thread safe operation
-// to return a pointer to a Channel object (potentially new)
-// for the given Topic
+//获得相应名称的channel
 func (t *Topic) GetChannel(channelName string) *Channel {
 	t.Lock()
+	//获取或者创建一个channel
 	channel, isNew := t.getOrCreateChannel(channelName)
 	t.Unlock()
-
+	//如果是新的channel，向更新channel写入数据
 	if isNew {
-		// update messagePump state
 		select {
 		case t.channelUpdateChan <- 1:
 		case <-t.exitChan:
 		}
 	}
-
 	return channel
 }
-
-// this expects the caller to handle locking
+//若channel不存在，则新建一个channel
+//若channel存在，则返回
 func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 	channel, ok := t.channelMap[channelName]
 	if !ok {
@@ -133,7 +133,7 @@ func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 	}
 	return channel, false
 }
-
+//获取一个存在的channel
 func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
 	t.RLock()
 	defer t.RUnlock()
@@ -143,8 +143,7 @@ func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
 	}
 	return channel, nil
 }
-
-// DeleteExistingChannel removes a channel from the topic only if it exists
+//删除一个存在的channel，赋值给channel的deleteFunc
 func (t *Topic) DeleteExistingChannel(channelName string) error {
 	t.Lock()
 	channel, ok := t.channelMap[channelName]
@@ -156,27 +155,19 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
 	// not defered so that we can continue while the channel async closes
 	numChannels := len(t.channelMap)
 	t.Unlock()
-
 	t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting channel %s", t.name, channel.name)
-
-	// delete empties the channel before closing
-	// (so that we dont leave any messages around)
 	channel.Delete()
-
-	// update messagePump state
 	select {
 	case t.channelUpdateChan <- 1:
 	case <-t.exitChan:
 	}
-
+	//每删除一个channel，判断一下是否需要清理该topic
 	if numChannels == 0 && t.ephemeral == true {
 		go t.deleter.Do(func() { t.deleteCallback(t) })
 	}
-
 	return nil
 }
-
-// PutMessage writes a Message to the queue
+//放入一个消息到内存
 func (t *Topic) PutMessage(m *Message) error {
 	t.RLock()
 	defer t.RUnlock()
@@ -191,17 +182,14 @@ func (t *Topic) PutMessage(m *Message) error {
 	atomic.AddUint64(&t.messageBytes, uint64(len(m.Body)))
 	return nil
 }
-
-// PutMessages writes multiple Messages to the queue
+//放入批量消息到内存
 func (t *Topic) PutMessages(msgs []*Message) error {
 	t.RLock()
 	defer t.RUnlock()
 	if atomic.LoadInt32(&t.exitFlag) == 1 {
 		return errors.New("exiting")
 	}
-
 	messageTotalBytes := 0
-
 	for i, m := range msgs {
 		err := t.put(m)
 		if err != nil {
@@ -211,12 +199,11 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 		}
 		messageTotalBytes += len(m.Body)
 	}
-
 	atomic.AddUint64(&t.messageBytes, uint64(messageTotalBytes))
 	atomic.AddUint64(&t.messageCount, uint64(len(msgs)))
 	return nil
 }
-
+//放入消息到channel，若内存已满，则放入到持久化队列当中
 func (t *Topic) put(m *Message) error {
 	select {
 	case t.memoryMsgChan <- m:
@@ -234,13 +221,11 @@ func (t *Topic) put(m *Message) error {
 	}
 	return nil
 }
-
+//返回消息数量
 func (t *Topic) Depth() int64 {
 	return int64(len(t.memoryMsgChan)) + t.backend.Depth()
 }
-
-// messagePump selects over the in-memory and backend queue and
-// writes messages to every channel for this topic
+//消息泵
 func (t *Topic) messagePump() {
 	var msg *Message
 	var buf []byte
@@ -248,8 +233,6 @@ func (t *Topic) messagePump() {
 	var chans []*Channel
 	var memoryMsgChan chan *Message
 	var backendChan <-chan []byte
-
-	// do not pass messages before Start(), but avoid blocking Pause() or GetChannel()
 	for {
 		select {
 		case <-t.channelUpdateChan:
@@ -271,8 +254,7 @@ func (t *Topic) messagePump() {
 		memoryMsgChan = t.memoryMsgChan
 		backendChan = t.backend.ReadChan()
 	}
-
-	// main message loop
+	//主消息循环
 	for {
 		select {
 		case msg = <-memoryMsgChan:
@@ -309,7 +291,6 @@ func (t *Topic) messagePump() {
 		case <-t.exitChan:
 			goto exit
 		}
-
 		for i, channel := range chans {
 			chanMsg := msg
 			// copy the message because each channel
@@ -333,41 +314,30 @@ func (t *Topic) messagePump() {
 			}
 		}
 	}
-
 exit:
 	t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing ... messagePump", t.name)
 }
-
-// Delete empties the topic and all its channels and closes
+//删除topic
 func (t *Topic) Delete() error {
 	return t.exit(true)
 }
-
-// Close persists all outstanding topic data and closes all its channels
+//关闭topic
 func (t *Topic) Close() error {
 	return t.exit(false)
 }
-
+//主exit函数
 func (t *Topic) exit(deleted bool) error {
 	if !atomic.CompareAndSwapInt32(&t.exitFlag, 0, 1) {
 		return errors.New("exiting")
 	}
-
 	if deleted {
 		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting", t.name)
-
-		// since we are explicitly deleting a topic (not just at system exit time)
-		// de-register this from the lookupd
 		t.ctx.nsqd.Notify(t)
 	} else {
 		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing", t.name)
 	}
-
 	close(t.exitChan)
-
-	// synchronize the close of messagePump()
 	t.waitGroup.Wait()
-
 	if deleted {
 		t.Lock()
 		for _, channel := range t.channelMap {
@@ -375,22 +345,15 @@ func (t *Topic) exit(deleted bool) error {
 			channel.Delete()
 		}
 		t.Unlock()
-
-		// empty the queue (deletes the backend files, too)
 		t.Empty()
 		return t.backend.Delete()
 	}
-
-	// close all the channels
 	for _, channel := range t.channelMap {
 		err := channel.Close()
 		if err != nil {
-			// we need to continue regardless of error to close all the channels
 			t.ctx.nsqd.logf(LOG_ERROR, "channel(%s) close - %s", channel.name, err)
 		}
 	}
-
-	// write anything leftover to disk
 	t.flush()
 	return t.backend.Close()
 }
@@ -403,20 +366,17 @@ func (t *Topic) Empty() error {
 			goto finish
 		}
 	}
-
 finish:
 	return t.backend.Empty()
 }
 
 func (t *Topic) flush() error {
 	var msgBuf bytes.Buffer
-
 	if len(t.memoryMsgChan) > 0 {
 		t.ctx.nsqd.logf(LOG_INFO,
 			"TOPIC(%s): flushing %d memory messages to backend",
 			t.name, len(t.memoryMsgChan))
 	}
-
 	for {
 		select {
 		case msg := <-t.memoryMsgChan:
@@ -429,7 +389,6 @@ func (t *Topic) flush() error {
 			goto finish
 		}
 	}
-
 finish:
 	return nil
 }
@@ -470,12 +429,10 @@ func (t *Topic) doPause(pause bool) error {
 	} else {
 		atomic.StoreInt32(&t.paused, 0)
 	}
-
 	select {
 	case t.pauseChan <- 1:
 	case <-t.exitChan:
 	}
-
 	return nil
 }
 

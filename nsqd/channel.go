@@ -503,6 +503,7 @@ func (c *Channel) processDeferredQueue(t int64) bool {
 	for {
 		//循环从延迟消息队列取出消息进行发送
 		c.deferredMutex.Lock()
+		//选取一条达到发送时间的message
 		item, _ := c.deferredPQ.PeekAndShift(t)
 		c.deferredMutex.Unlock()
 		if item == nil {
@@ -530,6 +531,7 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 	dirty := false
 	for {
 		c.inFlightMutex.Lock()
+		//选取一条达到超时时间的message
 		msg, _ := c.inFlightPQ.PeekAndShift(t)
 		c.inFlightMutex.Unlock()
 		if msg == nil {
