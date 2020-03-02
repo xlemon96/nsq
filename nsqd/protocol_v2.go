@@ -29,9 +29,9 @@ const (
 	//订阅等操作返回响应的类型
 	frameTypeResponse int32 = 0
 	//server处理发生错误
-	frameTypeError    int32 = 1
+	frameTypeError int32 = 1
 	//server端发送消息给订阅channel的client
-	frameTypeMessage  int32 = 2
+	frameTypeMessage int32 = 2
 )
 
 var separatorBytes = []byte(" ")
@@ -41,6 +41,7 @@ var okBytes = []byte("OK")
 type protocolV2 struct {
 	ctx *context
 }
+
 //主循环，此循环主要是接受客户端的消息并响应
 func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var err error
@@ -127,6 +128,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	p.ctx.nsqd.RemoveClient(client.ID)
 	return err
 }
+
 //发送message
 func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): writing msg(%s) to client(%s) - %s", msg.ID, client, msg.Body)
@@ -141,6 +143,7 @@ func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	}
 	return nil
 }
+
 //向客户端发送一个消息
 func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error {
 	//写锁，防止发送msg和发送response一起，造成数据混乱
@@ -165,6 +168,7 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 	client.writeLock.Unlock()
 	return err
 }
+
 //执行引擎，根据不同的命令名称执行不同的命令
 func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	if bytes.Equal(params[0], []byte("IDENTIFY")) {
@@ -200,6 +204,7 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	}
 	return nil, protocol.NewFatalClientErr(nil, "E_INVALID", fmt.Sprintf("invalid command %s", params[0]))
 }
+
 //消息泵
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
@@ -332,6 +337,7 @@ exit:
 		p.ctx.nsqd.logf(LOG_ERROR, "PROTOCOL(V2): [%s] messagePump error - %s", client, err)
 	}
 }
+
 //客户端连接server之后先发送鉴权包，在开始订阅或者发送消息等操作
 //根据客户端发送来的信息设置client的相关参数，比如writebuffer大小、msg超时时间等
 func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error) {
@@ -553,7 +559,11 @@ func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName str
 	}
 	return nil
 }
+
 //订阅一个channel
+//param0 commandName
+//param1 topicName
+//param2 channelName
 func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	//client的状态判断，不等于init，则抛出异常
 	if atomic.LoadInt32(&client.State) != stateInit {
@@ -609,6 +619,7 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	client.SubEventChan <- channel
 	return okBytes, nil
 }
+
 //指定可同时处理的消息数量
 //param0 commandName
 //param1 可处理消息数量
@@ -642,6 +653,7 @@ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	client.SetReadyCount(count)
 	return nil, nil
 }
+
 //消费完成
 //param0 commandName
 //param1 messageID
@@ -669,6 +681,7 @@ func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 	client.FinishedMessage()
 	return nil, nil
 }
+
 //消息重新加入队列
 //param0 commandName
 //param1 messageID
@@ -719,6 +732,7 @@ func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 
 	return nil, nil
 }
+
 //设置客户端状态为stateclosing
 //客户端收到closewait报文之后会关闭close连接
 //客户端会先关闭socket读
@@ -730,165 +744,143 @@ func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
 	client.StartClose()
 	return []byte("CLOSE_WAIT"), nil
 }
+
 //空函数
 func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+//发布单条消息
+//param0 commandName
+//param1 topicName
 func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
-
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "PUB insufficient number of parameters")
 	}
-
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
 			fmt.Sprintf("PUB topic name %q is not valid", topicName))
 	}
-
 	bodyLen, err := readLen(client.Reader, client.lenSlice)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body size")
 	}
-
 	if bodyLen <= 0 {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 			fmt.Sprintf("PUB invalid message body size %d", bodyLen))
 	}
-
 	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxMsgSize {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 			fmt.Sprintf("PUB message too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxMsgSize))
 	}
-
 	messageBody := make([]byte, bodyLen)
 	_, err = io.ReadFull(client.Reader, messageBody)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body")
 	}
-
 	if err := p.CheckAuth(client, "PUB", topicName, ""); err != nil {
 		return nil, err
 	}
-
 	topic := p.ctx.nsqd.GetTopic(topicName)
 	msg := NewMessage(topic.GenerateID(), messageBody)
 	err = topic.PutMessage(msg)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_PUB_FAILED", "PUB failed "+err.Error())
 	}
-
 	client.PublishedMessage(topicName, 1)
-
 	return okBytes, nil
 }
 
+//发布多条消息
+//param0 commandName
+//param1 topicName
 func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
-
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "MPUB insufficient number of parameters")
 	}
-
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
 			fmt.Sprintf("E_BAD_TOPIC MPUB topic name %q is not valid", topicName))
 	}
-
 	if err := p.CheckAuth(client, "MPUB", topicName, ""); err != nil {
 		return nil, err
 	}
-
 	topic := p.ctx.nsqd.GetTopic(topicName)
-
 	bodyLen, err := readLen(client.Reader, client.lenSlice)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "MPUB failed to read body size")
 	}
-
 	if bodyLen <= 0 {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
 			fmt.Sprintf("MPUB invalid body size %d", bodyLen))
 	}
-
 	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxBodySize {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
 			fmt.Sprintf("MPUB body too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxBodySize))
 	}
-
 	messages, err := readMPUB(client.Reader, client.lenSlice, topic,
 		p.ctx.nsqd.getOpts().MaxMsgSize, p.ctx.nsqd.getOpts().MaxBodySize)
 	if err != nil {
 		return nil, err
 	}
-
-	// if we've made it this far we've validated all the input,
-	// the only possible error is that the topic is exiting during
-	// this next call (and no messages will be queued in that case)
 	err = topic.PutMessages(messages)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_MPUB_FAILED", "MPUB failed "+err.Error())
 	}
-
 	client.PublishedMessage(topicName, uint64(len(messages)))
-
 	return okBytes, nil
 }
 
+//发布延迟消息
+//发布单条消息
+//param0 commandName
+//param1 topicName
+//param2 msgTimeout
 func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
-
 	if len(params) < 3 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "DPUB insufficient number of parameters")
 	}
-
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
 			fmt.Sprintf("DPUB topic name %q is not valid", topicName))
 	}
-
 	timeoutMs, err := protocol.ByteToBase10(params[2])
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_INVALID",
 			fmt.Sprintf("DPUB could not parse timeout %s", params[2]))
 	}
 	timeoutDuration := time.Duration(timeoutMs) * time.Millisecond
-
 	if timeoutDuration < 0 || timeoutDuration > p.ctx.nsqd.getOpts().MaxReqTimeout {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
 			fmt.Sprintf("DPUB timeout %d out of range 0-%d",
 				timeoutMs, p.ctx.nsqd.getOpts().MaxReqTimeout/time.Millisecond))
 	}
-
 	bodyLen, err := readLen(client.Reader, client.lenSlice)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "DPUB failed to read message body size")
 	}
-
 	if bodyLen <= 0 {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 			fmt.Sprintf("DPUB invalid message body size %d", bodyLen))
 	}
-
 	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxMsgSize {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 			fmt.Sprintf("DPUB message too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxMsgSize))
 	}
-
 	messageBody := make([]byte, bodyLen)
 	_, err = io.ReadFull(client.Reader, messageBody)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "DPUB failed to read message body")
 	}
-
 	if err := p.CheckAuth(client, "DPUB", topicName, ""); err != nil {
 		return nil, err
 	}
-
 	topic := p.ctx.nsqd.GetTopic(topicName)
 	msg := NewMessage(topic.GenerateID(), messageBody)
 	msg.deferred = timeoutDuration
@@ -896,11 +888,10 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_DPUB_FAILED", "DPUB failed "+err.Error())
 	}
-
 	client.PublishedMessage(topicName, 1)
-
 	return okBytes, nil
 }
+
 //更新message的timeout
 //message格式
 //param0 commandName
@@ -932,19 +923,19 @@ func (p *protocolV2) TOUCH(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+//读取MPUB的多条消息
+//body的前四个字节表示一共有多少条消息
 func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBodySize int64) ([]*Message, error) {
 	numMessages, err := readLen(r, tmp)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "MPUB failed to read message count")
 	}
-
 	// 4 == total num, 5 == length + min 1
 	maxMessages := (maxBodySize - 4) / 5
 	if numMessages <= 0 || int64(numMessages) > maxMessages {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
 			fmt.Sprintf("MPUB invalid message count %d", numMessages))
 	}
-
 	messages := make([]*Message, 0, numMessages)
 	for i := int32(0); i < numMessages; i++ {
 		messageSize, err := readLen(r, tmp)
@@ -952,28 +943,24 @@ func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBo
 			return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
 				fmt.Sprintf("MPUB failed to read message(%d) body size", i))
 		}
-
 		if messageSize <= 0 {
 			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 				fmt.Sprintf("MPUB invalid message(%d) body size %d", i, messageSize))
 		}
-
 		if int64(messageSize) > maxMessageSize {
 			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 				fmt.Sprintf("MPUB message too big %d > %d", messageSize, maxMessageSize))
 		}
-
 		msgBody := make([]byte, messageSize)
 		_, err = io.ReadFull(r, msgBody)
 		if err != nil {
 			return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "MPUB failed to read message body")
 		}
-
 		messages = append(messages, NewMessage(topic.GenerateID(), msgBody))
 	}
-
 	return messages, nil
 }
+
 //将byte切片转换为messageID指针，并进行长度校验
 func getMessageID(p []byte) (*MessageID, error) {
 	if len(p) != MsgIDLength {
@@ -981,6 +968,7 @@ func getMessageID(p []byte) (*MessageID, error) {
 	}
 	return (*MessageID)(unsafe.Pointer(&p[0])), nil
 }
+
 //若客户端发送消息有body，则读取body长度
 func readLen(r io.Reader, tmp []byte) (int32, error) {
 	_, err := io.ReadFull(r, tmp)
