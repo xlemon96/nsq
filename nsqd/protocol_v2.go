@@ -49,6 +49,8 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	//给client分配clinetID
 	clientID := atomic.AddInt64(&p.ctx.nsqd.clientIDSequence, 1)
 	//初始化client，client结构体主要封装conn，和一些状态参数
+	//client状态变更
+	///初始化之后为StateInit-->sub事件发生后为stateSubscribed-->cls事件发生后为StateClosing
 	client := newClientV2(clientID, conn, p.ctx)
 	//将此client添加到nsqd维护的结构体
 	p.ctx.nsqd.AddClient(client.ID, client)
@@ -81,10 +83,12 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		}
 		//客户端发送给过来的内容格式为
 		//命令名称 param1 param2 param3 \n len body
+		//此处只处理\n之前的内容，具体的body在有body的指令的处理过程中会再读取body内容
 		params := bytes.Split(line, separatorBytes)
 		p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
 		var response []byte
 		//执行命令
+		//成功，response为"OK"；若失败则为具体的error
 		response, err = p.Exec(client, params)
 		if err != nil {
 			ctx := ""
@@ -97,7 +101,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 				p.ctx.nsqd.logf(LOG_ERROR, "[%s] - %s%s", client, sendErr, ctx)
 				break
 			}
-			// errors of type FatalClientErr should forceably close the connection
+			//此处为发生致命错误，比如尚未sub频道就touch消息，则必须强行关闭连接
 			if _, ok := err.(*protocol.FatalClientErr); ok {
 				break
 			}
@@ -196,7 +200,7 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	}
 	return nil, protocol.NewFatalClientErr(nil, "E_INVALID", fmt.Sprintf("invalid command %s", params[0]))
 }
-//消息包泵
+//消息泵
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
 	var memoryMsgChan chan *Message
@@ -222,6 +226,9 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	close(startedChan)
 	for {
 		//若client为准备好接受msg，则相关变量均置为nil
+		//IsReadyForMessages判断当前服务器的压力，若inFlightCount >= readyCount
+		//也即在处理的消息大于或者等于能处理的消息数量，则不进行消息发送
+		//且此时需要强行flush，尽快将消息发送给客户端
 		if subChannel == nil || !client.IsReadyForMessages() {
 			memoryMsgChan = nil
 			backendMsgChan = nil
@@ -326,6 +333,7 @@ exit:
 	}
 }
 //客户端连接server之后先发送鉴权包，在开始订阅或者发送消息等操作
+//根据客户端发送来的信息设置client的相关参数，比如writebuffer大小、msg超时时间等
 func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 	if atomic.LoadInt32(&client.State) != stateInit {
@@ -601,22 +609,22 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	client.SubEventChan <- channel
 	return okBytes, nil
 }
-
+//指定可同时处理的消息数量
+//param0 commandName
+//param1 可处理消息数量
 func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
-
+	//若连接已关闭，则忽略该请求
 	if state == stateClosing {
-		// just ignore ready changes on a closing channel
 		p.ctx.nsqd.logf(LOG_INFO,
 			"PROTOCOL(V2): [%s] ignoring RDY after CLS in state ClientStateV2Closing",
 			client)
 		return nil, nil
 	}
-
+	//未订阅返回error
 	if state != stateSubscribed {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot RDY in current state")
 	}
-
 	count := int64(1)
 	if len(params) > 1 {
 		b10, err := protocol.ByteToBase10(params[1])
@@ -626,45 +634,45 @@ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 		}
 		count = int64(b10)
 	}
-
+	//若count不符合范围，则抛出异常，否则客户端状态会异常
 	if count < 0 || count > p.ctx.nsqd.getOpts().MaxRdyCount {
-		// this needs to be a fatal error otherwise clients would have
-		// inconsistent state
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
 			fmt.Sprintf("RDY count %d out of range 0-%d", count, p.ctx.nsqd.getOpts().MaxRdyCount))
 	}
-
 	client.SetReadyCount(count)
-
 	return nil, nil
 }
-
+//消费完成
+//param0 commandName
+//param1 messageID
 func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
+	//若client状态不正确，则抛出异常
 	if state != stateSubscribed && state != stateClosing {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot FIN in current state")
 	}
-
+	//校验参数个数
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "FIN insufficient number of params")
 	}
-
 	id, err := getMessageID(params[1])
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", err.Error())
 	}
-
+	//更新channel的状态值，并将channel内存中的消息删除(主要是待确定消息队列)
 	err = client.Channel.FinishMessage(client.ID, *id)
 	if err != nil {
 		return nil, protocol.NewClientErr(err, "E_FIN_FAILED",
 			fmt.Sprintf("FIN %s failed %s", *id, err.Error()))
 	}
-
+	//更新client状态值
 	client.FinishedMessage()
-
 	return nil, nil
 }
-
+//消息重新加入队列
+//param0 commandName
+//param1 messageID
+//param2 messageTimeout
 func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
@@ -711,17 +719,18 @@ func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
 
 	return nil, nil
 }
-
+//设置客户端状态为stateclosing
+//客户端收到closewait报文之后会关闭close连接
+//客户端会先关闭socket读
+//再关闭socket写，此时server端read会抛出error--EOF，从而捕获异常完成server端关闭连接
 func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
 	if atomic.LoadInt32(&client.State) != stateSubscribed {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot CLS in current state")
 	}
-
 	client.StartClose()
-
 	return []byte("CLOSE_WAIT"), nil
 }
-
+//空函数
 func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
@@ -892,31 +901,34 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 
 	return okBytes, nil
 }
-
+//更新message的timeout
+//message格式
+//param0 commandName
+//param1 messageID
 func (p *protocolV2) TOUCH(client *clientV2, params [][]byte) ([]byte, error) {
+	//判断client的状态，若未订阅频道或者已关闭，则返回error
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot TOUCH in current state")
 	}
-
+	//若参数小于2个，则返回error
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "TOUCH insufficient number of params")
 	}
-
+	//获取messageID
 	id, err := getMessageID(params[1])
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", err.Error())
 	}
-
 	client.writeLock.RLock()
 	msgTimeout := client.MsgTimeout
 	client.writeLock.RUnlock()
+	//调用channel的touchmessage接口更新消息超时时间
 	err = client.Channel.TouchMessage(client.ID, *id, msgTimeout)
 	if err != nil {
 		return nil, protocol.NewClientErr(err, "E_TOUCH_FAILED",
 			fmt.Sprintf("TOUCH %s failed %s", *id, err.Error()))
 	}
-
 	return nil, nil
 }
 
@@ -962,8 +974,7 @@ func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBo
 
 	return messages, nil
 }
-
-// validate and cast the bytes on the wire to a message ID
+//将byte切片转换为messageID指针，并进行长度校验
 func getMessageID(p []byte) (*MessageID, error) {
 	if len(p) != MsgIDLength {
 		return nil, errors.New("Invalid Message ID")
