@@ -1,5 +1,9 @@
 package nsqd
 
+/*
+	临时topic和channel采用空持久化队列，内存满了之后则消息丢弃
+*/
+
 type dummyBackendQueue struct {
 	readChan chan []byte
 }

@@ -15,7 +15,7 @@ import (
 //
 // A lookupPeer instance is designed to connect lazily to nsqlookupd and reconnect
 // gracefully (i.e. it is all handled by the library).  Clients can simply use the
-// Command interface to perform a round-trip.
+// Command iface to perform a round-trip.
 type lookupPeer struct {
 	logf            lg.AppLogFunc
 	addr            string
@@ -63,19 +63,19 @@ func (lp *lookupPeer) String() string {
 	return lp.addr
 }
 
-// Read implements the io.Reader interface, adding deadlines
+// Read implements the io.Reader iface, adding deadlines
 func (lp *lookupPeer) Read(data []byte) (int, error) {
 	lp.conn.SetReadDeadline(time.Now().Add(time.Second))
 	return lp.conn.Read(data)
 }
 
-// Write implements the io.Writer interface, adding deadlines
+// Write implements the io.Writer iface, adding deadlines
 func (lp *lookupPeer) Write(data []byte) (int, error) {
 	lp.conn.SetWriteDeadline(time.Now().Add(time.Second))
 	return lp.conn.Write(data)
 }
 
-// Close implements the io.Closer interface
+// Close implements the io.Closer iface
 func (lp *lookupPeer) Close() error {
 	lp.state = stateDisconnected
 	if lp.conn != nil {
